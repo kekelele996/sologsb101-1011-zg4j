@@ -32,7 +32,6 @@ import {
   remapIds,
   validateBackup
 } from '@/utils/export'
-import { fitPowerCurve } from '@/types/rating'
 
 const ratingStore = useRatingStore()
 const stationStore = useStationStore()
@@ -49,7 +48,7 @@ const exporting = ref(false)
 const compareRows = computed(() => ratingStore.compareRows)
 const overLimitRows = computed(() => ratingStore.overLimitRows)
 
-/** 检测结论：按测站汇总测次、最新水位、定线参数与超限点据 */
+/** 检测结论：按测站汇总测次、最新水位、定线参数与超限 / 复核点据 */
 const conclusions = ref<
   Array<{
     stationId: string
@@ -59,6 +58,7 @@ const conclusions = ref<
     latestStageM: number | null
     ratingCount: number
     overLimitCount: number
+    reviewedCount: number
     fitText: string
   }>
 >([])
@@ -71,15 +71,8 @@ async function refreshCounts(): Promise<void> {
 
 async function buildConclusions(): Promise<void> {
   const payload = await buildBackupPayload()
-  const fits = ratingStore.lineNos.map((lineNo) =>
-    fitPowerCurve(
-      payload.ratings
-        .filter((rating) => rating.lineNo === lineNo)
-        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s })),
-      lineNo
-    )
-  )
-  conclusions.value = buildConclusionLines(payload, fits)
+  // 定线参数取 store 按生效点据（复核值优先）拟合的当前成果，保证导出结论与页面一致
+  conclusions.value = buildConclusionLines(payload, ratingStore.allFits)
 }
 
 async function handleExport(): Promise<void> {
@@ -124,9 +117,11 @@ async function handleImport(): Promise<void> {
       { type: 'warning', confirmButtonText: '继续导入', cancelButtonText: '取消' }
     )
     await importBackup(payload, overwriteOnImport.value)
+    // 按导入的复核记录重算全部定线的曲线流量 / 偏差 / 结论，避免备份里的旧比测值直接落地
+    await ratingStore.rebuildAllCompares()
     await refreshCounts()
     await buildConclusions()
-    ElMessage.success('导入完成')
+    ElMessage.success('导入完成，已按复核记录重算全部比测')
   } finally {
     importing.value = false
   }
@@ -149,10 +144,10 @@ async function handleReset(): Promise<void> {
 }
 
 async function refreshAll(): Promise<void> {
-  await ratingStore.rebuildCompares(ratingStore.activeLineNo)
+  const count = await ratingStore.rebuildAllCompares()
   await refreshCounts()
   await buildConclusions()
-  ElMessage.success('已重新定线并刷新结构版本信息')
+  ElMessage.success(`已按生效点据重新定线，刷新比测 ${count} 条`)
 }
 
 onMounted(() => {
@@ -189,6 +184,13 @@ onMounted(() => {
         :tone="ratingStore.fitQuality.overLimitCount > 0 ? 'warning' : 'success'"
         icon="TrendCharts"
       />
+      <StatBadge
+        label="复核变更"
+        :value="ratingStore.fitQuality.reviewedCount"
+        suffix="条"
+        :tone="ratingStore.fitQuality.reviewedCount > 0 ? 'warning' : 'success'"
+        icon="PieChart"
+      />
     </div>
 
     <el-card shadow="never" class="gb-panel">
@@ -217,9 +219,14 @@ onMounted(() => {
             <span class="gb-mono">{{ row.ratingCount }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="超限" width="90" align="right">
+        <el-table-column label="超限" width="80" align="right">
           <template #default="{ row }">
             <span class="gb-mono" :class="{ 'page__danger': row.overLimitCount > 0 }">{{ row.overLimitCount }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="复核" width="80" align="right">
+          <template #default="{ row }">
+            <span class="gb-mono" :class="{ 'page__review': row.reviewedCount > 0 }">{{ row.reviewedCount }}</span>
           </template>
         </el-table-column>
         <el-table-column prop="fitText" label="定线成果" min-width="320" show-overflow-tooltip />
@@ -233,8 +240,14 @@ onMounted(() => {
           <el-tag v-if="overLimitRows.length > 0" type="danger" size="small" effect="plain">
             <el-icon><Warning /></el-icon> {{ overLimitRows.length }} 条超限
           </el-tag>
+          <el-tag v-if="ratingStore.fitQuality.reviewedCount > 0" type="warning" size="small" effect="plain">
+            {{ ratingStore.fitQuality.reviewedCount }} 条复核变更
+          </el-tag>
         </h3>
-        <span class="gb-hint">偏差 = (曲线流量 − 实测流量) / 实测流量 × 100%，限值 {{ ratingStore.deviationLimitPct }}%</span>
+        <span class="gb-hint">
+          偏差 = (曲线流量 − 实测流量) / 实测流量 × 100%，限值 {{ ratingStore.deviationLimitPct }}%；
+          复核点据按复核值算，下方「初测」保留初次比测结果
+        </span>
       </div>
 
       <EmptyPanel
@@ -258,29 +271,58 @@ onMounted(() => {
             <span class="gb-mono">{{ row.rating ? row.rating.stageM.toFixed(2) : '—' }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="实测流量" width="130" align="right">
+        <el-table-column label="实测流量" width="140" align="right">
           <template #default="{ row }">
-            <span class="gb-mono">{{ row.compare.measuredFlow.toFixed(1) }}</span>
+            <div class="gb-mono page__flow-main">{{ row.compare.measuredFlow.toFixed(1) }}</div>
+            <div v-if="row.reviewed && row.initial" class="gb-cell-sub gb-mono">
+              初测 {{ row.initial.measuredFlow.toFixed(1) }}
+            </div>
           </template>
         </el-table-column>
-        <el-table-column label="曲线流量" width="130" align="right">
+        <el-table-column label="曲线流量" width="140" align="right">
           <template #default="{ row }">
-            <span class="gb-mono">{{ row.compare.curveFlow.toFixed(1) }}</span>
+            <div class="gb-mono page__flow-main">{{ row.compare.curveFlow.toFixed(1) }}</div>
+            <div v-if="row.reviewed && row.initial" class="gb-cell-sub gb-mono">
+              初测 {{ row.initial.curveFlow.toFixed(1) }}
+            </div>
           </template>
         </el-table-column>
-        <el-table-column label="偏差判定" width="210">
+        <el-table-column label="偏差判定" min-width="230">
           <template #default="{ row }">
             <DeviationTag
               :deviation-pct="row.compare.deviationPct"
               :verdict="row.compare.verdict"
               :limit="ratingStore.deviationLimitPct"
             />
+            <div v-if="row.reviewed && row.initial" class="gb-cell-sub">
+              <span class="gb-cell-sub__label">初测</span>
+              <DeviationTag
+                :deviation-pct="row.initial.deviationPct"
+                :verdict="row.initial.verdict"
+                :limit="ratingStore.deviationLimitPct"
+                size="small"
+              />
+            </div>
           </template>
         </el-table-column>
-        <el-table-column prop="compare.operator" label="比测人" width="100" />
-        <el-table-column label="比测日期" min-width="150">
+        <el-table-column label="状态" width="110" align="center">
           <template #default="{ row }">
-            <span class="gb-mono">{{ new Date(row.compare.comparedAt).toLocaleDateString('zh-CN') }}</span>
+            <el-tag v-if="row.reviewed" type="warning" size="small" effect="dark">已复核</el-tag>
+            <el-tag v-else type="info" size="small" effect="plain">初测</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="比测 / 复核人" min-width="120">
+          <template #default="{ row }">
+            <div>{{ row.compare.operator }}</div>
+            <div v-if="row.reviewed" class="gb-cell-sub">{{ row.compare.reviewer ?? '复核' }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="比测 / 复核日期" min-width="150">
+          <template #default="{ row }">
+            <div class="gb-mono">{{ new Date(row.compare.comparedAt).toLocaleDateString('zh-CN') }}</div>
+            <div v-if="row.reviewed && row.compare.reviewedAt" class="gb-cell-sub gb-mono">
+              {{ new Date(row.compare.reviewedAt).toLocaleDateString('zh-CN') }}
+            </div>
           </template>
         </el-table-column>
       </el-table>
@@ -290,7 +332,7 @@ onMounted(() => {
       <div class="gb-panel-title">
         <h3>全量 JSON 导入导出</h3>
         <span class="gb-hint">
-          导出内容包含 stations / sections / verticals / points / ratings / compares 六张表
+          导出内容包含 stations / sections / verticals / points / ratings / compares / reviews 七张表
         </span>
       </div>
 
@@ -334,6 +376,7 @@ onMounted(() => {
         <el-descriptions-item label="点据 / 比测">
           {{ counts.ratings ?? 0 }} / {{ counts.compares ?? 0 }}
         </el-descriptions-item>
+        <el-descriptions-item label="复核记录">{{ counts.reviews ?? 0 }}</el-descriptions-item>
         <el-descriptions-item label="最近备份时间">
           {{ lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份' }}
         </el-descriptions-item>
@@ -372,5 +415,26 @@ onMounted(() => {
 .page__danger {
   color: #c0392b;
   font-weight: 700;
+}
+
+.page__review {
+  color: #b9770e;
+  font-weight: 700;
+}
+
+.page__flow-main {
+  font-weight: 600;
+  color: #1f3446;
+}
+
+.gb-cell-sub {
+  margin-top: 2px;
+  font-size: 12px;
+  line-height: 18px;
+  color: #8a99a6;
+}
+
+.gb-cell-sub__label {
+  margin-right: 4px;
 }
 </style>

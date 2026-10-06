@@ -11,9 +11,18 @@ import {
   stampBackupTime,
   type BackupPayload
 } from '@/utils/db'
+import { reviewMatchKey, type FlowReview } from '@/types/review'
 
 /** 备份集合键名 */
-export const BACKUP_KEYS = ['stations', 'sections', 'verticals', 'points', 'ratings', 'compares'] as const
+export const BACKUP_KEYS = [
+  'stations',
+  'sections',
+  'verticals',
+  'points',
+  'ratings',
+  'compares',
+  'reviews'
+] as const
 export type BackupKey = (typeof BACKUP_KEYS)[number]
 
 /** 各表行数统计（导出页展示与导入结果回执共用） */
@@ -21,13 +30,14 @@ export type CountMap = Record<BackupKey, number>
 
 /** 组装当前本地数据的完整快照 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [stations, sections, verticals, points, ratings, compares] = await Promise.all([
+  const [stations, sections, verticals, points, ratings, compares, reviews] = await Promise.all([
     db.stations.toArray(),
     db.sections.toArray(),
     db.verticals.toArray(),
     db.points.toArray(),
     db.ratings.toArray(),
-    db.compares.toArray()
+    db.compares.toArray(),
+    db.reviews.toArray()
   ])
   return {
     app: 'gbhydrogaug',
@@ -38,7 +48,8 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     verticals,
     points,
     ratings,
-    compares
+    compares,
+    reviews
   }
 }
 
@@ -52,7 +63,9 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
   if (obj.app !== 'gbhydrogaug' && obj.app !== undefined) {
     errors.push('app 字段应为 gbhydrogaug，文件来源不明')
   }
+  // reviews 为 v3 新增：v2 旧备份缺省时按「无复核」处理，不阻断导入
   for (const key of BACKUP_KEYS) {
+    if (key === 'reviews') continue
     if (!Array.isArray(obj[key])) errors.push(`${key} 字段缺失或不是数组`)
   }
   if (errors.length > 0) return { ok: false, errors, payload: null }
@@ -65,7 +78,8 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
     verticals: obj.verticals ?? [],
     points: obj.points ?? [],
     ratings: obj.ratings ?? [],
-    compares: obj.compares ?? []
+    compares: obj.compares ?? [],
+    reviews: Array.isArray(obj.reviews) ? obj.reviews : []
   }
   return { ok: true, errors, payload }
 }
@@ -78,7 +92,8 @@ export function countPayload(payload: BackupPayload): CountMap {
     verticals: payload.verticals.length,
     points: payload.points.length,
     ratings: payload.ratings.length,
-    compares: payload.compares.length
+    compares: payload.compares.length,
+    reviews: payload.reviews.length
   }
 }
 
@@ -116,7 +131,7 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
   if (overwrite) await clearAllTables()
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares, db.reviews],
     async () => {
       await db.stations.bulkPut(payload.stations)
       await db.sections.bulkPut(payload.sections)
@@ -124,6 +139,7 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
       await db.points.bulkPut(payload.points)
       await db.ratings.bulkPut(payload.ratings)
       await db.compares.bulkPut(payload.compares)
+      await db.reviews.bulkPut(payload.reviews)
     }
   )
   return countPayload(payload)
@@ -166,12 +182,19 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     id: createId('cmp'),
     ratingId: ratingMap.get(compare.ratingId) ?? compare.ratingId
   }))
-  return { ...payload, stations, sections, verticals, points, ratings, compares }
+  // 复核记录的 matchKey 只含测次号与水位，重分配 id 后仍能命中新点据
+  const reviews = payload.reviews.map((review) => ({
+    ...review,
+    id: createId('rev'),
+    ratingId: review.ratingId ? ratingMap.get(review.ratingId) ?? null : null
+  }))
+  return { ...payload, stations, sections, verticals, points, ratings, compares, reviews }
 }
 
 /**
  * 生成结论文本：按测站输出最新水位、断面测次、定线参数与超限点据。
- * 供导出页的「检测结论」区域使用。
+ * 供导出页的「检测结论」区域使用。超限 / 复核统计均取当前生效值
+ * （点据补录复核流量后，曲线流量、偏差、结论按复核值走）。
  */
 export interface ConclusionLine {
   stationId: string
@@ -181,6 +204,8 @@ export interface ConclusionLine {
   latestStageM: number | null
   ratingCount: number
   overLimitCount: number
+  /** 本站本次复核过的点据数（整编员可据此识别本次复核变化） */
+  reviewedCount: number
   fitText: string
 }
 
@@ -188,6 +213,10 @@ export function buildConclusionLines(
   payload: BackupPayload,
   fits: Array<{ lineNo: string; valid: boolean; a: number; b: number; h0: number; meanResidualPct: number; sampleCount: number }>
 ): ConclusionLine[] {
+  const reviewKeySet = new Set(
+    payload.reviews.map((review) => reviewMatchKey(review.measureNo, review.stageM))
+  )
+
   return payload.stations.map((station) => {
     const sections = payload.sections.filter((section) => section.stationId === station.id)
     const latest = sections.reduce<number | null>((acc, section) => {
@@ -196,8 +225,10 @@ export function buildConclusionLines(
     }, null)
     const ratings = payload.ratings.filter((rating) => rating.stationId === station.id)
     const ratingIds = new Set(ratings.map((rating) => rating.id))
-    const overLimitCount = payload.compares.filter(
-      (compare) => ratingIds.has(compare.ratingId) && compare.verdict === '超限'
+    const stationCompares = payload.compares.filter((compare) => ratingIds.has(compare.ratingId))
+    const overLimitCount = stationCompares.filter((compare) => compare.verdict === '超限').length
+    const reviewedCount = ratings.filter((rating) =>
+      reviewKeySet.has(reviewMatchKey(rating.measureNo, rating.stageM))
     ).length
     const lines = Array.from(new Set(ratings.map((rating) => rating.lineNo)))
     const fitParts = lines.map((lineNo) => {
@@ -213,6 +244,7 @@ export function buildConclusionLines(
       latestStageM: latest,
       ratingCount: ratings.length,
       overLimitCount,
+      reviewedCount,
       fitText: fitParts.length > 0 ? fitParts.join('；') : '暂无关系点据'
     }
   })

@@ -8,6 +8,7 @@ import { db, createId, readLastStationId, watchTable, writeLastStationId } from 
 import type { Station } from '@/types/station'
 import type { Section } from '@/types/section'
 import { createEmptyStationFilter, type StationFilterState } from '@/types/station'
+import { reviewMatchKey } from '@/types/review'
 
 export const useStationStore = defineStore('station', () => {
   const stations = ref<Station[]>([])
@@ -121,11 +122,11 @@ export const useStationStore = defineStore('station', () => {
     await db.stations.update(id, { ...patch, updatedAt: Date.now() } as never)
   }
 
-  /** 删除测站：级联删除其断面、垂线、测点、点据与比测记录 */
+  /** 删除测站：级联删除其断面、垂线、测点、点据、比测记录与复核记录 */
   async function removeStation(id: string): Promise<void> {
     await db.transaction(
       'rw',
-      [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+      [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares, db.reviews],
       async () => {
         const sectionIds = (await db.sections.where('stationId').equals(id).toArray()).map((row) => row.id)
         const verticalIds =
@@ -139,9 +140,27 @@ export const useStationStore = defineStore('station', () => {
           await db.verticals.where('sectionId').anyOf(sectionIds).delete()
           await db.sections.where('stationId').equals(id).delete()
         }
-        const ratingIds = (await db.ratings.where('stationId').equals(id).toArray()).map((row) => row.id)
+        const stationRatings = await db.ratings.where('stationId').equals(id).toArray()
+        const ratingIds = stationRatings.map((row) => row.id)
         if (ratingIds.length > 0) {
           await db.compares.where('ratingId').anyOf(ratingIds).delete()
+          // 按测次号 + 水位清理只属于本站点据的复核记录
+          const removedKeys = new Set(
+            stationRatings.map((row) => reviewMatchKey(row.measureNo, row.stageM))
+          )
+          const remainingKeys = new Set(
+            (await db.ratings.toArray())
+              .filter((row) => row.stationId !== id)
+              .map((row) => reviewMatchKey(row.measureNo, row.stageM))
+          )
+          const orphanReviews = (await db.reviews.toArray())
+            .filter(
+              (review) =>
+                removedKeys.has(reviewMatchKey(review.measureNo, review.stageM)) &&
+                !remainingKeys.has(reviewMatchKey(review.measureNo, review.stageM))
+            )
+            .map((review) => review.id)
+          if (orphanReviews.length > 0) await db.reviews.bulkDelete(orphanReviews)
           await db.ratings.where('stationId').equals(id).delete()
         }
         await db.stations.delete(id)

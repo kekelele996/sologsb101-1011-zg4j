@@ -12,12 +12,13 @@ import type { Vertical } from '@/types/vertical'
 import type { Point } from '@/types/point'
 import type { Rating } from '@/types/rating'
 import type { Compare } from '@/types/compare'
+import type { FlowReview } from '@/types/review'
 import { calcDeviationPct, judgeDeviation } from '@/types/compare'
 import { fitPowerCurve } from '@/types/rating'
 import { calcMeanVelocity, DEFAULT_WEIGHTS, round } from '@/utils/flow'
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbhydrogaug'
@@ -40,6 +41,7 @@ export interface BackupPayload {
   points: Point[]
   ratings: Rating[]
   compares: Compare[]
+  reviews: FlowReview[]
 }
 
 class HydroGaugeDatabase extends Dexie {
@@ -49,6 +51,7 @@ class HydroGaugeDatabase extends Dexie {
   points!: Table<Point, string>
   ratings!: Table<Rating, string>
   compares!: Table<Compare, string>
+  reviews!: Table<FlowReview, string>
 
   constructor() {
     super(DB_NAME)
@@ -94,6 +97,32 @@ class HydroGaugeDatabase extends Dexie {
               Object.assign(row, defaults())
             })
         }
+      })
+
+    // v3：新增 reviews 表（复核流量补录），compares 固化初测快照并挂复核字段。
+    // 复核后点据的曲线流量 / 偏差 / 结论按复核值重算，初测结果留在 initial 里可回查。
+    this.version(DB_VERSION)
+      .stores({
+        reviews: 'id, measureNo, stageM, lineNo, ratingId, reviewedAt, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        await tx
+          .table('compares')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            // v2 及以前的比测记录均为初次比测结果，整体固化为初测快照
+            if (typeof row.initial !== 'object' || row.initial === null) {
+              row.initial = {
+                measuredFlow: typeof row.measuredFlow === 'number' ? row.measuredFlow : 0,
+                curveFlow: typeof row.curveFlow === 'number' ? row.curveFlow : 0,
+                deviationPct: typeof row.deviationPct === 'number' ? row.deviationPct : 0,
+                verdict: row.verdict === '超限' ? '超限' : '合格'
+              }
+            }
+            if (typeof row.reviewFlowM3s !== 'number') row.reviewFlowM3s = null
+            if (!('reviewer' in row)) row.reviewer = null
+            if (!('reviewedAt' in row)) row.reviewedAt = null
+          })
       })
   }
 }
@@ -289,7 +318,7 @@ export async function seedDemoData(): Promise<void> {
 
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares, db.reviews],
     async () => {
       const stamp = (row: { id: string }): { createdAt: number; updatedAt: number } => ({
         createdAt: now + row.id.length,
@@ -338,6 +367,15 @@ export async function seedDemoData(): Promise<void> {
           verdict: judgeDeviation(deviationPct),
           operator: rating.lineNo === 'C' ? '周渝' : '林昭',
           comparedAt: rating.measuredAt,
+          initial: {
+            measuredFlow: rating.flowM3s,
+            curveFlow: predicted,
+            deviationPct,
+            verdict: judgeDeviation(deviationPct)
+          },
+          reviewFlowM3s: null,
+          reviewer: null,
+          reviewedAt: null,
           createdAt: now,
           updatedAt: now
         })
@@ -353,6 +391,15 @@ export async function seedDemoData(): Promise<void> {
           verdict: judgeDeviation(calcDeviationPct(97.5, 100.2)),
           operator: '林昭',
           comparedAt: iso,
+          initial: {
+            measuredFlow: 97.5,
+            curveFlow: 100.2,
+            deviationPct: calcDeviationPct(97.5, 100.2),
+            verdict: judgeDeviation(calcDeviationPct(97.5, 100.2))
+          },
+          reviewFlowM3s: null,
+          reviewer: null,
+          reviewedAt: null,
           createdAt: now,
           updatedAt: now
         })
@@ -375,7 +422,7 @@ export async function initDatabase(): Promise<void> {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares, db.reviews],
     async () => {
       await Promise.all([
         db.stations.clear(),
@@ -383,7 +430,8 @@ export async function clearAllTables(): Promise<void> {
         db.verticals.clear(),
         db.points.clear(),
         db.ratings.clear(),
-        db.compares.clear()
+        db.compares.clear(),
+        db.reviews.clear()
       ])
     }
   )
@@ -397,15 +445,16 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与导出页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [stations, sections, verticals, points, ratings, compares] = await Promise.all([
+  const [stations, sections, verticals, points, ratings, compares, reviews] = await Promise.all([
     db.stations.count(),
     db.sections.count(),
     db.verticals.count(),
     db.points.count(),
     db.ratings.count(),
-    db.compares.count()
+    db.compares.count(),
+    db.reviews.count()
   ])
-  return { stations, sections, verticals, points, ratings, compares }
+  return { stations, sections, verticals, points, ratings, compares, reviews }
 }
 
 /** 写入结构版本号到 localStorage，便于导出页比对 */
