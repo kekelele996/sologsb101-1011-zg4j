@@ -30,9 +30,11 @@ import {
   importBackup,
   readFileText,
   remapIds,
-  validateBackup
+  validateBackup,
+  type ConclusionLine
 } from '@/utils/export'
 import { fitPowerCurve } from '@/types/rating'
+import { activeReviewByRatingId, effectiveFlowOf } from '@/types/review'
 
 const ratingStore = useRatingStore()
 const stationStore = useStationStore()
@@ -49,19 +51,8 @@ const exporting = ref(false)
 const compareRows = computed(() => ratingStore.compareRows)
 const overLimitRows = computed(() => ratingStore.overLimitRows)
 
-/** 检测结论：按测站汇总测次、最新水位、定线参数与超限点据 */
-const conclusions = ref<
-  Array<{
-    stationId: string
-    stationName: string
-    river: string
-    sectionCount: number
-    latestStageM: number | null
-    ratingCount: number
-    overLimitCount: number
-    fitText: string
-  }>
->([])
+/** 检测结论：按测站汇总测次、最新水位、定线参数、超限点据与复核点据 */
+const conclusions = ref<ConclusionLine[]>([])
 
 async function refreshCounts(): Promise<void> {
   counts.value = await countAll()
@@ -71,11 +62,16 @@ async function refreshCounts(): Promise<void> {
 
 async function buildConclusions(): Promise<void> {
   const payload = await buildBackupPayload()
+  // 定线参数按有效流量拟合：被复核的点据以复核流量入线，结论与页面口径一致
+  const reviewMap = activeReviewByRatingId(payload.reviews)
   const fits = ratingStore.lineNos.map((lineNo) =>
     fitPowerCurve(
       payload.ratings
         .filter((rating) => rating.lineNo === lineNo)
-        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s })),
+        .map((rating) => ({
+          stageM: rating.stageM,
+          flowM3s: effectiveFlowOf(rating, reviewMap.get(rating.id) ?? null)
+        })),
       lineNo
     )
   )
@@ -189,6 +185,13 @@ onMounted(() => {
         :tone="ratingStore.fitQuality.overLimitCount > 0 ? 'warning' : 'success'"
         icon="TrendCharts"
       />
+      <StatBadge
+        label="复核点据"
+        :value="ratingStore.fitQuality.reviewedCount"
+        suffix="点"
+        :tone="ratingStore.fitQuality.reviewedCount > 0 ? 'warning' : 'info'"
+        icon="Files"
+      />
     </div>
 
     <el-card shadow="never" class="gb-panel">
@@ -217,12 +220,17 @@ onMounted(() => {
             <span class="gb-mono">{{ row.ratingCount }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="超限" width="90" align="right">
+        <el-table-column label="超限" width="80" align="right">
           <template #default="{ row }">
             <span class="gb-mono" :class="{ 'page__danger': row.overLimitCount > 0 }">{{ row.overLimitCount }}</span>
           </template>
         </el-table-column>
-        <el-table-column prop="fitText" label="定线成果" min-width="320" show-overflow-tooltip />
+        <el-table-column label="复核" width="80" align="right">
+          <template #default="{ row }">
+            <span class="gb-mono" :class="{ 'page__reviewed': row.reviewedCount > 0 }">{{ row.reviewedCount }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="fitText" label="定线成果" min-width="300" show-overflow-tooltip />
       </el-table>
     </el-card>
 
@@ -234,7 +242,10 @@ onMounted(() => {
             <el-icon><Warning /></el-icon> {{ overLimitRows.length }} 条超限
           </el-tag>
         </h3>
-        <span class="gb-hint">偏差 = (曲线流量 − 实测流量) / 实测流量 × 100%，限值 {{ ratingStore.deviationLimitPct }}%</span>
+        <span class="gb-hint">
+          偏差 = (曲线流量 − 实测流量) / 实测流量 × 100%，限值 {{ ratingStore.deviationLimitPct }}%；
+          标「复核值」的行按复核流量重算，初次比测结果以小字留痕
+        </span>
       </div>
 
       <EmptyPanel
@@ -258,23 +269,38 @@ onMounted(() => {
             <span class="gb-mono">{{ row.rating ? row.rating.stageM.toFixed(2) : '—' }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="实测流量" width="130" align="right">
+        <el-table-column label="实测流量" width="140" align="right">
           <template #default="{ row }">
-            <span class="gb-mono">{{ row.compare.measuredFlow.toFixed(1) }}</span>
+            <span class="gb-mono" :class="{ 'page__reviewed': row.compare.reviewed === true }">
+              {{ row.compare.measuredFlow.toFixed(1) }}
+            </span>
+            <el-tag v-if="row.compare.reviewed === true" size="small" type="warning" effect="plain" class="page__review-tag">
+              复核值
+            </el-tag>
+            <div v-if="row.compare.initial" class="gb-hint page__initial">
+              初测 {{ row.compare.initial.measuredFlow.toFixed(1) }}
+            </div>
           </template>
         </el-table-column>
-        <el-table-column label="曲线流量" width="130" align="right">
+        <el-table-column label="曲线流量" width="120" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.compare.curveFlow.toFixed(1) }}</span>
+            <div v-if="row.compare.initial" class="gb-hint page__initial">
+              初次 {{ row.compare.initial.curveFlow.toFixed(1) }}
+            </div>
           </template>
         </el-table-column>
-        <el-table-column label="偏差判定" width="210">
+        <el-table-column label="偏差判定" width="220">
           <template #default="{ row }">
             <DeviationTag
               :deviation-pct="row.compare.deviationPct"
               :verdict="row.compare.verdict"
               :limit="ratingStore.deviationLimitPct"
             />
+            <div v-if="row.compare.initial" class="gb-hint page__initial">
+              初次：{{ row.compare.initial.deviationPct > 0 ? '+' : '' }}{{ row.compare.initial.deviationPct.toFixed(2) }}%
+              · {{ row.compare.initial.verdict }}
+            </div>
           </template>
         </el-table-column>
         <el-table-column prop="compare.operator" label="比测人" width="100" />
@@ -290,7 +316,7 @@ onMounted(() => {
       <div class="gb-panel-title">
         <h3>全量 JSON 导入导出</h3>
         <span class="gb-hint">
-          导出内容包含 stations / sections / verticals / points / ratings / compares 六张表
+          导出内容包含 stations / sections / verticals / points / ratings / compares / reviews 七张表
         </span>
       </div>
 
@@ -334,6 +360,9 @@ onMounted(() => {
         <el-descriptions-item label="点据 / 比测">
           {{ counts.ratings ?? 0 }} / {{ counts.compares ?? 0 }}
         </el-descriptions-item>
+        <el-descriptions-item label="复核记录">
+          {{ counts.reviews ?? 0 }}
+        </el-descriptions-item>
         <el-descriptions-item label="最近备份时间">
           {{ lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份' }}
         </el-descriptions-item>
@@ -372,5 +401,20 @@ onMounted(() => {
 .page__danger {
   color: #c0392b;
   font-weight: 700;
+}
+
+.page__reviewed {
+  color: #b9770e;
+  font-weight: 700;
+}
+
+.page__review-tag {
+  margin-left: 6px;
+}
+
+.page__initial {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.4;
 }
 </style>

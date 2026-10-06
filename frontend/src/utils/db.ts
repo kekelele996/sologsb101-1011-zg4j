@@ -12,12 +12,12 @@ import type { Vertical } from '@/types/vertical'
 import type { Point } from '@/types/point'
 import type { Rating } from '@/types/rating'
 import type { Compare } from '@/types/compare'
-import { calcDeviationPct, judgeDeviation } from '@/types/compare'
-import { fitPowerCurve } from '@/types/rating'
-import { calcMeanVelocity, DEFAULT_WEIGHTS, round } from '@/utils/flow'
+import { DEVIATION_LIMIT_PCT, buildComparesForLine, calcDeviationPct, judgeDeviation } from '@/types/compare'
+import type { Review } from '@/types/review'
+import { calcMeanVelocity, DEFAULT_WEIGHTS } from '@/utils/flow'
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbhydrogaug'
@@ -40,6 +40,7 @@ export interface BackupPayload {
   points: Point[]
   ratings: Rating[]
   compares: Compare[]
+  reviews: Review[]
 }
 
 class HydroGaugeDatabase extends Dexie {
@@ -49,6 +50,7 @@ class HydroGaugeDatabase extends Dexie {
   points!: Table<Point, string>
   ratings!: Table<Rating, string>
   compares!: Table<Compare, string>
+  reviews!: Table<Review, string>
 
   constructor() {
     super(DB_NAME)
@@ -64,7 +66,7 @@ class HydroGaugeDatabase extends Dexie {
     })
 
     // v2：补齐筛选与统计需要的索引（河名/集水面积、水位、测法、偏差判定）
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         stations: 'id, name, river, sectionCode, catchmentKm2, updatedAt',
         sections: 'id, stationId, measureNo, method, stageM, measuredAt, updatedAt',
@@ -94,6 +96,21 @@ class HydroGaugeDatabase extends Dexie {
               Object.assign(row, defaults())
             })
         }
+      })
+
+    // v3：新增复核记录表（点据复核流量补录），比测记录补齐复核标记与初次快照字段
+    this.version(DB_VERSION)
+      .stores({
+        reviews: 'id, ratingId, measureNo, reviewedAt, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        await tx
+          .table('compares')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (typeof row.reviewed !== 'boolean') row.reviewed = false
+            if (row.initial === undefined) row.initial = null
+          })
       })
   }
 }
@@ -287,9 +304,23 @@ export async function seedDemoData(): Promise<void> {
     { id: 'rat_bs_c4', stationId: 'stn_bs03', stageM: 6.44, flowM3s: 288.0, lineNo: 'C', measureNo: '2024-08-008', measuredAt: '2024-08-15T09:40:00.000Z' }
   ]
 
+  // 复核演示：C 线 5.88 m 点据（2024-07-007 测次）补录复核流量，
+  // 演示复核后曲线流量 / 偏差 / 结论按复核值重算、初次比测结果留痕可查
+  const reviewSeeds: Array<Omit<Review, 'createdAt' | 'updatedAt'>> = [
+    {
+      id: 'rev_bs_c3',
+      ratingId: 'rat_bs_c3',
+      measureNo: '2024-07-007',
+      stageM: 5.88,
+      reviewFlow: 298.6,
+      operator: '周渝',
+      reviewedAt: '2024-07-26T09:30:00.000Z'
+    }
+  ]
+
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares, db.reviews],
     async () => {
       const stamp = (row: { id: string }): { createdAt: number; updatedAt: number } => ({
         createdAt: now + row.id.length,
@@ -315,32 +346,38 @@ export async function seedDemoData(): Promise<void> {
         )
       )
       await db.ratings.bulkPut(ratingSeeds.map((rating) => ({ ...rating, ...stamp(rating) })))
+      const stampedReviews: Review[] = reviewSeeds.map((review) => ({ ...review, ...stamp(review) }))
+      await db.reviews.bulkPut(stampedReviews)
 
-      // 比测记录：按定线拟合出曲线流量后计算偏差与判定，保证与页面展示一致
+      // 比测记录：与页面「重新定线」共用同一套构建逻辑，保证与页面展示一致。
+      // 先按原始流量生成初次比测，再应用复核记录重算——被复核改变的点据自动留下初次快照。
+      const lineNos = Array.from(new Set(ratingSeeds.map((rating) => rating.lineNo)))
       const compares: Compare[] = []
-      const lineGroups = new Map<string, Array<{ stageM: number; flowM3s: number }>>()
-      ratingSeeds.forEach((rating) => {
-        const list = lineGroups.get(rating.lineNo) ?? []
-        list.push({ stageM: rating.stageM, flowM3s: rating.flowM3s })
-        lineGroups.set(rating.lineNo, list)
-      })
-      ratingSeeds.forEach((rating) => {
-        const fit = fitPowerCurve(lineGroups.get(rating.lineNo) ?? [], rating.lineNo)
-        if (!fit.valid) return
-        const predicted = round(fit.a * Math.pow(Math.max(rating.stageM - fit.h0, 1e-6), fit.b), 2)
-        const deviationPct = calcDeviationPct(rating.flowM3s, predicted)
-        compares.push({
-          id: `cmp_${rating.id}`,
-          ratingId: rating.id,
-          measuredFlow: rating.flowM3s,
-          curveFlow: predicted,
-          deviationPct,
-          verdict: judgeDeviation(deviationPct),
-          operator: rating.lineNo === 'C' ? '周渝' : '林昭',
-          comparedAt: rating.measuredAt,
-          createdAt: now,
-          updatedAt: now
+      lineNos.forEach((lineNo) => {
+        const lineRatings = ratingSeeds.filter((rating) => rating.lineNo === lineNo)
+        const operatorFallback = lineNo === 'C' ? '周渝' : '林昭'
+        const firstPass = buildComparesForLine({
+          lineNo,
+          ratings: lineRatings,
+          reviews: [],
+          existing: [],
+          limitPct: DEVIATION_LIMIT_PCT,
+          operatorFallback,
+          now,
+          createId: () => createId('cmp')
         })
+        const finalPass = buildComparesForLine({
+          lineNo,
+          ratings: lineRatings,
+          reviews: stampedReviews,
+          existing: firstPass.compares,
+          limitPct: DEVIATION_LIMIT_PCT,
+          operatorFallback,
+          now,
+          createId: () => createId('cmp')
+        })
+        // 播种使用确定性 id，便于演示数据重置后比对
+        compares.push(...finalPass.compares.map((compare) => ({ ...compare, id: `cmp_${compare.ratingId}` })))
       })
       await db.compares.bulkPut(compares)
       if (compares.length === 0) {
@@ -375,7 +412,7 @@ export async function initDatabase(): Promise<void> {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares, db.reviews],
     async () => {
       await Promise.all([
         db.stations.clear(),
@@ -383,7 +420,8 @@ export async function clearAllTables(): Promise<void> {
         db.verticals.clear(),
         db.points.clear(),
         db.ratings.clear(),
-        db.compares.clear()
+        db.compares.clear(),
+        db.reviews.clear()
       ])
     }
   )
@@ -397,15 +435,16 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与导出页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [stations, sections, verticals, points, ratings, compares] = await Promise.all([
+  const [stations, sections, verticals, points, ratings, compares, reviews] = await Promise.all([
     db.stations.count(),
     db.sections.count(),
     db.verticals.count(),
     db.points.count(),
     db.ratings.count(),
-    db.compares.count()
+    db.compares.count(),
+    db.reviews.count()
   ])
-  return { stations, sections, verticals, points, ratings, compares }
+  return { stations, sections, verticals, points, ratings, compares, reviews }
 }
 
 /** 写入结构版本号到 localStorage，便于导出页比对 */

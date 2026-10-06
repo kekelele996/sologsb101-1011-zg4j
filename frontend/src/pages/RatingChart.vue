@@ -6,7 +6,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, Edit, Plus, Refresh, TrendCharts } from '@element-plus/icons-vue'
+import { Delete, Edit, Plus, Refresh, Stamp, TrendCharts } from '@element-plus/icons-vue'
 import FilterBar from '@/components/common/FilterBar.vue'
 import type { FilterModel } from '@/types/filter'
 import StatBadge from '@/components/common/StatBadge.vue'
@@ -34,26 +34,40 @@ const form = reactive({
   measuredAt: new Date().toISOString().slice(0, 16)
 })
 
+/** 复核补录对话框状态 */
+const reviewDialogVisible = ref(false)
+const reviewSubmitting = ref(false)
+const reviewTarget = ref<Rating | null>(null)
+const reviewForm = reactive({
+  reviewFlow: null as number | null,
+  operator: '林昭'
+})
+
 const fit = computed(() => ratingStore.activeFit)
 const lineNos = computed(() => (ratingStore.lineNos.length > 0 ? ratingStore.lineNos : ['A']))
 
-/** 当前定线号下的点据（含曲线流量与残差） */
+/** 当前定线号下的点据（含曲线流量与残差；复核点据按复核流量计算） */
 const pointRows = computed(() =>
   ratingStore.ratings
     .filter((rating) => rating.lineNo === ratingStore.activeLineNo)
     .sort((a, b) => a.stageM - b.stageM)
     .map((rating) => {
+      const review = ratingStore.reviewByRatingId.get(rating.id) ?? null
+      const measured = ratingStore.effectiveFlowOfRating(rating)
       const predicted = fit.value.valid ? Number((fit.value.a * Math.pow(Math.max(rating.stageM - fit.value.h0, 1e-6), fit.value.b)).toFixed(2)) : 0
       const residualPct =
-        fit.value.valid && rating.flowM3s > 0
-          ? Number((((rating.flowM3s - predicted) / rating.flowM3s) * 100).toFixed(2))
+        fit.value.valid && measured > 0
+          ? Number((((measured - predicted) / measured) * 100).toFixed(2))
           : 0
       const compare = ratingStore.compares.find((item) => item.ratingId === rating.id)
       return {
         rating,
         stationName: ratingStore.stationNameOf(rating.stationId),
+        review,
+        measured,
         predicted,
         residualPct,
+        compare,
         verdict: compare?.verdict ?? (Math.abs(residualPct) > ratingStore.deviationLimitPct ? '超限' : '合格')
       }
     })
@@ -66,14 +80,14 @@ const filterModel = computed<FilterModel>(() => ({
   verdicts: ratingStore.filter.verdicts
 }))
 
-/** 关系曲线坐标：横轴水位、纵轴流量 */
+/** 关系曲线坐标：横轴水位、纵轴流量（复核点据按复核流量落点并换色标记） */
 const chart = computed(() => {
   const rows = pointRows.value
   if (rows.length === 0) {
-    return { samples: '', points: [] as Array<{ id: string; cx: number; cy: number; verdict: string }>, stageMin: 0, stageMax: 0, flowMax: 0 }
+    return { samples: '', points: [] as Array<{ id: string; cx: number; cy: number; verdict: string; reviewed: boolean }>, stageMin: 0, stageMax: 0, flowMax: 0 }
   }
   const stages = rows.map((row) => row.rating.stageM)
-  const flows = rows.map((row) => row.rating.flowM3s)
+  const flows = rows.map((row) => row.measured)
   const stageMin = Math.min(...stages)
   const stageMax = Math.max(...stages)
   const flowMax = Math.max(...flows) * 1.1
@@ -95,8 +109,9 @@ const chart = computed(() => {
     points: rows.map((row) => ({
       id: row.rating.id,
       cx: toX(row.rating.stageM),
-      cy: toY(row.rating.flowM3s),
-      verdict: row.verdict
+      cy: toY(row.measured),
+      verdict: row.verdict,
+      reviewed: row.review !== null
     })),
     stageMin,
     stageMax,
@@ -182,7 +197,7 @@ async function removeRating(rating: Rating): Promise<void> {
 
 async function refit(): Promise<void> {
   const result: RatingFitResult = fitPowerCurve(
-    pointRows.value.map((row) => ({ stageM: row.rating.stageM, flowM3s: row.rating.flowM3s })),
+    pointRows.value.map((row) => ({ stageM: row.rating.stageM, flowM3s: row.measured })),
     ratingStore.activeLineNo
   )
   ratingStore.setFit(result)
@@ -193,6 +208,40 @@ async function refit(): Promise<void> {
     )
   } else {
     ElMessage.warning(result.message || '当前点据不足以定线')
+  }
+}
+
+/** 打开复核补录对话框：回填当前生效的复核值，留空或 0 表示放弃复核 */
+function openReview(row: { rating: Rating; review: { reviewFlow: number; operator: string } | null }): void {
+  reviewTarget.value = row.rating
+  reviewForm.reviewFlow = row.review ? row.review.reviewFlow : null
+  reviewForm.operator = row.review?.operator ?? '林昭'
+  reviewDialogVisible.value = true
+}
+
+async function submitReviewForm(): Promise<void> {
+  if (!reviewTarget.value) return
+  if (reviewForm.reviewFlow !== null && (!Number.isFinite(reviewForm.reviewFlow) || reviewForm.reviewFlow < 0)) {
+    ElMessage.warning('复核流量应为不小于 0 的数字；留空或填 0 表示放弃复核')
+    return
+  }
+  reviewSubmitting.value = true
+  try {
+    const result = await ratingStore.submitReview({
+      ratingId: reviewTarget.value.id,
+      reviewFlow: reviewForm.reviewFlow,
+      operator: reviewForm.operator
+    })
+    if (result === 'saved') {
+      ElMessage.success('复核流量已补录，该点据的曲线流量、偏差与结论已按复核值重算')
+    } else if (result === 'revoked') {
+      ElMessage.success('已放弃复核，该点据回到初次比测结果')
+    } else {
+      ElMessage.error('点据不存在，无法补录复核')
+    }
+    reviewDialogVisible.value = false
+  } finally {
+    reviewSubmitting.value = false
   }
 }
 
@@ -242,6 +291,7 @@ onMounted(() => {
         <h2 class="page__title">水位流量关系点据与定线</h2>
         <p class="gb-hint">
           点据按定线号分组做幂函数拟合 Q = a×(H-H0)^b，残差超过 {{ ratingStore.deviationLimitPct }}% 的点据自动挂红并进入比测分析清单。
+          补录复核流量后，该点据的曲线流量、偏差与结论按复核值重算，初次比测结果保留可查。
         </p>
       </div>
       <div class="page__actions">
@@ -303,6 +353,13 @@ onMounted(() => {
         :tone="pointRows.some((row) => row.verdict === '超限') ? 'danger' : 'success'"
         :icon="pointRows.some((row) => row.verdict === '超限') ? 'WarningFilled' : 'DataLine'"
       />
+      <StatBadge
+        label="复核点据"
+        :value="pointRows.filter((row) => row.review).length"
+        suffix="点"
+        :tone="pointRows.some((row) => row.review) ? 'warning' : 'info'"
+        icon="Files"
+      />
     </div>
 
     <el-alert
@@ -335,19 +392,33 @@ onMounted(() => {
             <span class="gb-mono">{{ row.rating.stageM.toFixed(2) }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="实测流量 (m³/s)" width="150" align="right">
+        <el-table-column label="实测流量 (m³/s)" width="140" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.rating.flowM3s.toFixed(1) }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="曲线流量 (m³/s)" width="150" align="right">
+        <el-table-column label="复核流量 (m³/s)" width="150" align="right">
+          <template #default="{ row }">
+            <template v-if="row.review">
+              <span class="gb-mono page__reviewed-flow">{{ row.review.reviewFlow.toFixed(1) }}</span>
+              <el-tag size="small" type="warning" effect="plain" class="page__review-tag">已复核</el-tag>
+            </template>
+            <span v-else class="gb-hint">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="曲线流量 (m³/s)" width="140" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.predicted > 0 ? row.predicted.toFixed(1) : '—' }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="残差" width="200">
+        <el-table-column label="残差" width="230">
           <template #default="{ row }">
             <DeviationTag :deviation-pct="row.residualPct" :verdict="row.verdict" :limit="ratingStore.deviationLimitPct" />
+            <div v-if="row.compare?.initial" class="gb-hint page__initial">
+              初次：曲线 {{ row.compare.initial.curveFlow.toFixed(1) }} ·
+              {{ row.compare.initial.deviationPct > 0 ? '+' : '' }}{{ row.compare.initial.deviationPct.toFixed(2) }}%
+              · {{ row.compare.initial.verdict }}
+            </div>
           </template>
         </el-table-column>
         <el-table-column label="测站 / 测次" min-width="180">
@@ -361,8 +432,11 @@ onMounted(() => {
             <span class="gb-mono">{{ new Date(row.rating.measuredAt).toLocaleDateString('zh-CN') }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="160" fixed="right">
+        <el-table-column label="操作" width="240" fixed="right">
           <template #default="{ row }">
+            <el-button size="small" :icon="Stamp" :type="row.review ? 'warning' : 'primary'" plain @click="openReview(row)">
+              复核
+            </el-button>
             <el-button size="small" :icon="Edit" @click="openEdit(row.rating)">编辑</el-button>
             <el-button size="small" type="danger" plain :icon="Delete" @click="removeRating(row.rating)">删除</el-button>
           </template>
@@ -388,12 +462,12 @@ onMounted(() => {
             :cx="point.cx"
             :cy="point.cy"
             r="4.5"
-            :fill="point.verdict === '超限' ? '#c0392b' : '#7fd1e8'"
-            :stroke="point.verdict === '超限' ? '#7b241c' : '#0f4c75'"
+            :fill="point.verdict === '超限' ? '#c0392b' : point.reviewed ? '#e6a23c' : '#7fd1e8'"
+            :stroke="point.verdict === '超限' ? '#7b241c' : point.reviewed ? '#b9770e' : '#0f4c75'"
           />
         </svg>
         <EmptyPanel v-else title="暂无可绘制的点据" description="录入点据后自动生成关系曲线。" compact />
-        <p class="gb-hint">红点表示残差超限的点据，曲线为幂函数定线成果。</p>
+        <p class="gb-hint">红点表示残差超限的点据，橙点表示已按复核流量重算的点据，曲线为幂函数定线成果。</p>
       </el-card>
     </div>
 
@@ -427,6 +501,44 @@ onMounted(() => {
         <el-button type="primary" :loading="submitting" @click="submitForm">
           {{ editingId ? '保存并重算' : '新增并定线' }}
         </el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="reviewDialogVisible" title="补录复核流量" width="560px" :close-on-click-modal="false">
+      <template v-if="reviewTarget">
+        <el-descriptions :column="2" border size="small" class="page__review-meta">
+          <el-descriptions-item label="水位">{{ reviewTarget.stageM.toFixed(2) }} m</el-descriptions-item>
+          <el-descriptions-item label="测次号">{{ reviewTarget.measureNo || '未标记测次' }}</el-descriptions-item>
+          <el-descriptions-item label="实测流量">{{ reviewTarget.flowM3s.toFixed(1) }} m³/s</el-descriptions-item>
+          <el-descriptions-item label="定线号">{{ reviewTarget.lineNo }} 线</el-descriptions-item>
+        </el-descriptions>
+        <el-form label-width="110px">
+          <el-form-item label="复核流量">
+            <el-input-number
+              v-model="reviewForm.reviewFlow"
+              :min="0"
+              :max="100000"
+              :step="1"
+              :precision="1"
+              controls-position="right"
+              placeholder="留空或 0 表示放弃复核"
+            />
+            <span class="page__unit">m³/s</span>
+          </el-form-item>
+          <el-form-item label="复核人">
+            <el-input v-model="reviewForm.operator" maxlength="16" placeholder="复核人姓名" />
+          </el-form-item>
+        </el-form>
+        <el-alert
+          type="info"
+          show-icon
+          :closable="false"
+          title="补录后该点据的曲线流量、偏差与结论按复核值重算，初次比测结果保留可查；同一次测流同一水位重复补录只保留最后一次。留空或填 0 表示放弃复核，点据回到初次比测结果。"
+        />
+      </template>
+      <template #footer>
+        <el-button @click="reviewDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="reviewSubmitting" @click="submitReviewForm">确认补录</el-button>
       </template>
     </el-dialog>
   </section>
@@ -483,6 +595,25 @@ onMounted(() => {
   margin-left: 8px;
   font-size: 12px;
   color: #8194a2;
+}
+
+.page__reviewed-flow {
+  color: #b9770e;
+  font-weight: 700;
+}
+
+.page__review-tag {
+  margin-left: 6px;
+}
+
+.page__initial {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.page__review-meta {
+  margin-bottom: 14px;
 }
 
 .page__full {

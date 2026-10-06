@@ -1,6 +1,7 @@
 /**
  * useRatingFit：水位流量点据拟合、残差与定线状态管理。
  * 被关系点据页与导出页消费；点据数据来自 ratingStore（IndexedDB 实时订阅）。
+ * 有有效复核的点据按复核流量参与拟合与残差计算，与 ratingStore 口径一致。
  */
 import { computed, ref, type ComputedRef, type Ref } from 'vue'
 import { storeToRefs } from 'pinia'
@@ -78,7 +79,7 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
     lineNos.value.map((lineNo) => {
       const points = ratings.value
         .filter((rating) => rating.lineNo === lineNo)
-        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s }))
+        .map((rating) => ({ stageM: rating.stageM, flowM3s: ratingStore.effectiveFlowOfRating(rating) }))
       return fitPowerCurve(points, lineNo)
     })
   )
@@ -95,10 +96,11 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
       .filter((rating) => rating.lineNo === activeLineNo.value)
       .sort((a, b) => a.stageM - b.stageM)
       .map((rating) => {
+        const measured = ratingStore.effectiveFlowOfRating(rating)
         const predicted = current.valid ? curveFlow(current, rating.stageM) : 0
         const residualPct =
-          current.valid && rating.flowM3s > 0
-            ? Number((((rating.flowM3s - predicted) / rating.flowM3s) * 100).toFixed(2))
+          current.valid && measured > 0
+            ? Number((((measured - predicted) / measured) * 100).toFixed(2))
             : 0
         return {
           rating,
@@ -130,10 +132,11 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
       ratings.value
         .filter((rating) => rating.lineNo === item.lineNo)
         .map((rating) => {
+          const measured = ratingStore.effectiveFlowOfRating(rating)
           const predicted = item.valid ? curveFlow(item, rating.stageM) : 0
           const residualPct =
-            item.valid && rating.flowM3s > 0
-              ? Number((((rating.flowM3s - predicted) / rating.flowM3s) * 100).toFixed(2))
+            item.valid && measured > 0
+              ? Number((((measured - predicted) / measured) * 100).toFixed(2))
               : 0
           return {
             rating,
@@ -158,7 +161,7 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
   function refit(): RatingFitResult {
     const points = ratings.value
       .filter((rating) => rating.lineNo === activeLineNo.value)
-      .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s }))
+      .map((rating) => ({ stageM: rating.stageM, flowM3s: ratingStore.effectiveFlowOfRating(rating) }))
     const result = fitPowerCurve(points, activeLineNo.value)
     ratingStore.setFit(result)
     return result
